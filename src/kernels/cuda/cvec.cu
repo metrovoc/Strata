@@ -101,6 +101,7 @@ const Cvec& cvec() { return g_cvec; }
 bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int mode, int first, int last,
                  int64_t n_embd, int64_t hc, std::string& err) {
     if (n_embd < 1 || n_embd > (int64_t) THREADS * MAXK) { err = "control vector: unsupported n_embd"; return false; }
+    if (mode == 2) { err = "control vector: --cvec-mode mlp is implemented on Metal only"; return false; }
     if (s.empty() || dir.size() != s.size() * (size_t) n_embd) { err = "control vector: bad table sizes"; return false; }
     int prev = 0;   // a new vector replaces the old one on every device
     cudaGetDevice(&prev);

@@ -61,3 +61,31 @@ kernel void slc_touch(device const uint4* src [[buffer(0)]], device uint* sink [
     }
     if (s == 0x9e3779b9u) sink[0] = s;
 }
+
+// cvec_add_bo: bo[t] += v, a control vector in --cvec-mode mlp (cvec_metal.cpp): the layer's MLP output before its
+// hyper-connection write, so stream c gets 2 sigmoid(inj[c] / hc) v as from the layer's own neurons.  on = 0: unchanged.
+kernel void cvec_add_bo(device float* bo [[buffer(0)]], device const float* v [[buffer(1)]], device const int* on [[buffer(2)]],
+                        constant GlueArgs& a [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.n_tok * a.n_embd || on[0] == 0) return;
+    bo[gid] += v[gid % a.n_embd];
+}
+
+// rnorm_cap (STRATA_METAL_RNORM): |R[t][c]| for every token and stream, into out[t * hc + c].  One threadgroup per (c, t),
+// 256 threads; a.n = hc.
+kernel void rnorm_cap(device const float* R [[buffer(0)]], device float* out [[buffer(1)]], constant GlueArgs& a [[buffer(2)]],
+                      uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                      ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float part[8];
+    const uint c = tg.x, t = tg.y, n = a.n_embd;
+    device const float* r = R + (t * a.n + c) * n;
+    float ss = 0.0f;
+    for (uint d = tid; d < n; d += 256) ss = fma(r[d], r[d], ss);
+    ss = simd_sum(ss);
+    if (lane == 0) part[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (int i = 0; i < 8; ++i) tot += part[i];
+        out[t * a.n + c] = sqrt(tot);
+    }
+}

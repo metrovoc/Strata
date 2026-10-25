@@ -7,6 +7,8 @@
 //
 //   project:  h <- h - s_l (h . v_l) v_l        v_l = d / |d|, s_l = |d|, d = the scaled direction
 //   add:      h <- h + d                        llama.cpp's stock additive control vector
+//   mlp:      bo <- bo + d before the write     d enters stream c as 2 sigmoid(inj[c] / hc) d, as the layer's own
+//                                               MLP output does: a neuron push (Metal only; covers() stays false)
 //
 // for l in [first, last].  `d` is the GGUF's `direction.<src>` times the file's scale (summed over files), with
 // src = l (per-layer) or one fixed layer (single:L, project mode only), exactly as llama.cpp's loader places it;
@@ -26,7 +28,7 @@ struct Cvec {
     const float* dir = nullptr;   ///< device, n_layers * n_embd: project = the unit v_l, add = d_l; zero rows elsewhere
     const float* s = nullptr;     ///< device, n_layers: project = s_l, add = 1; 0 = the layer is not steered
     const int* on = nullptr;      ///< device int: 0 = this request runs the stock model
-    int mode = 0;                 ///< 0 = project, 1 = add
+    int mode = 0;                 ///< 0 = project, 1 = add, 2 = mlp
     int first = 0, last = -1;     ///< the steered layers, inclusive
     int64_t n_embd = 0, hc = 0;
     bool loaded() const { return dir != nullptr; }

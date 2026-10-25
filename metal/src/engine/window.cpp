@@ -47,6 +47,11 @@
 #include <vector>
 
 namespace strata::gpu { uint64_t purge_device_allocations(size_t min_bytes); }   // metal/src/gpu/runtime.cpp
+namespace strata::metal_engine {   // cvec_metal.cpp
+const std::vector<float>& cvec_dir();
+bool cvec_layer(int l);
+void cvec_bind_flag(int* on);
+}  // namespace strata::metal_engine
 
 namespace strata::metal_engine {
 
@@ -185,6 +190,14 @@ private:
     void gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, bool apply, const Act& out, bool final_, int ntok);
     void layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0);
     void ple_cpu(int T);
+    // --cvec-mode mlp (cvec_metal.cpp): layer l's vector added to its MLP output `bo` before the hyper-connection write
+    mtl::Buffer cvbuf_, cvon_;
+    void cvec_bo(std::vector<mtl::Dispatch>& ds, int l, const mtl::Buffer& bo, int ntok);
+    // STRATA_METAL_RNORM=FILE: |R| leaving every layer for every decoded token and stream, appended to FILE per window
+    // as an int32 Tn and f32 [48][Tn][4] (the dose unit of a neuron push)
+    mtl::Buffer rn_;
+    void rnorm(std::vector<mtl::Dispatch>& ds, int l, int ntok);
+    void rnorm_dump(int Tn);
     // the MTP layer: the input branches + attention HC read + K/V append for `n` rows (srcR rows, host tokens) at
     // cells cell0..; with `full` (n == 1) the rest of the layer too and the draft head into mlm_/tokout_.  The
     // embedding rows go to memb_ rows erow..; tokens == nullptr: memb_ row erow already holds the embedding (put
@@ -778,6 +791,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
     const std::string b = "blk." + std::to_string(l) + ".";
     // ---- the mixer: layer 1's read after the PLE is not applied again (its pending write was applied before it)
     gr_read(ds, b + "hc_attn", l > 0 && !(l == 1 && ple_on_), XA_, false, ntok);
+    if (l > 0) rnorm(ds, l - 1, ntok);
     if (l % 4 != 3) {
         const int gi = l - l / 4;
         // a one-token window commits in the step; a longer one leaves the state and commit() folds the kept prefix
@@ -1010,6 +1024,50 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         d.tg[0] = 256;
         push(ds, d);
     }
+    cvec_bo(ds, l, bo_, ntok);
+}
+
+void Window::cvec_bo(std::vector<mtl::Dispatch>& ds, int l, const mtl::Buffer& bo, int ntok) {
+    if (!cvec_layer(l)) return;
+    if (!cvbuf_.ptr) {
+        const std::vector<float>& dir = cvec_dir();
+        cvbuf_ = cx_->alloc(dir.size() * 4);
+        std::memcpy(cvbuf_.ptr, dir.data(), dir.size() * 4);
+        cvon_ = cx_->alloc(16);
+        cvec_bind_flag(cvon_.as<int>());
+    }
+    GlueArgs a{N, (uint32_t) ntok, N, 0};
+    mtl::Dispatch d;
+    d.p = P(lib_, "cvec_add_bo", {}, "cvec_add_bo");
+    d.args = {mtl::Arg::B(bo), mtl::Arg::B(cvbuf_, (size_t) l * N * 4), mtl::Arg::B(cvon_), mtl::Arg::V(a)};
+    d.grid[0] = (ntok * N + 255) / 256;
+    d.tg[0] = 256;
+    push(ds, d);
+}
+
+void Window::rnorm(std::vector<mtl::Dispatch>& ds, int l, int ntok) {
+    static const bool on = std::getenv("STRATA_METAL_RNORM") != nullptr;
+    if (!on) return;
+    if (!rn_.ptr) rn_ = cx_->alloc((size_t) 48 * MAXT * HC * 4);
+    GlueArgs a{HC, (uint32_t) ntok, N, 0};
+    mtl::Dispatch d;
+    d.p = P(lib_, "rnorm_cap", {}, "rnorm_cap");
+    d.args = {mtl::Arg::B(R_), mtl::Arg::B(rn_, (size_t) l * MAXT * HC * 4), mtl::Arg::V(a)};
+    d.grid[0] = HC;
+    d.grid[1] = ntok;
+    d.tg[0] = 256;
+    push(ds, d);
+}
+
+void Window::rnorm_dump(int Tn) {
+    static const char* path = std::getenv("STRATA_METAL_RNORM");
+    if (path == nullptr || !rn_.ptr) return;
+    if (FILE* f = std::fopen(path, "ab")) {
+        const int32_t tn = Tn;
+        std::fwrite(&tn, 4, 1, f);
+        for (int l = 0; l < 48; ++l) std::fwrite(rn_.as<float>() + (size_t) l * MAXT * HC, 4, (size_t) Tn * HC, f);
+        std::fclose(f);
+    }
 }
 
 namespace {
@@ -1138,6 +1196,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         }
         tp_rg_ = now_ms() - r0;
         last_n_disp_ = (int) c.ds.size();
+        rnorm_dump(Tn);
         return finish(Tn, tokens, pos0, head, out, t0);
     }
     if (stream_ && !st_->ready() && !stream_arena(err)) return false;
@@ -1194,6 +1253,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     for (int l = 1; l < 48; ++l) layer(ds, l, Tn, pos0);
     // ---- the final mixer and the head
     gr_read(ds, "output_hc", true, XA_, true, Tn);
+    rnorm(ds, 47, Tn);
     if (head) gemv(ds, T("output.weight"), XA_, lm_, (size_t) n_vocab_, Tn);
     if (head) {
         ArgArgs a{(uint32_t) n_vocab_, 120};
@@ -1217,6 +1277,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     last_gpu_ms_ = 1000.0 * run_ds(cw);
     tp_rg_ = now_ms() - r0;
     last_n_disp_ = (int) ds.size();
+    rnorm_dump(Tn);
     return finish(Tn, tokens, pos0, head, out, t0);
 }
 
@@ -2516,6 +2577,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         const uint32_t oa[2] = {(uint32_t) T, N};
         D(PP(p.lib, "moe_out"), {mtl::Arg::B(p.yr), mtl::Arg::B(p.ys), mtl::Arg::B(p.sgv), mtl::Arg::B(p.bo), mtl::Arg::V(oa)},
           (T * N + 255) / 256, 1, 256);
+        cvec_bo(ds, l, p.bo, T);
         if (l == 0 && ple_on_) {
             // layer 0's FFN write applied to R, then the PLE block (as the window, for T rows)
             const gguf::Tensor& tn = TN("blk.1.hc_attn_norm.weight");

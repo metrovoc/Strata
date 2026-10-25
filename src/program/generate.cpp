@@ -802,7 +802,7 @@ struct Options {
     /// 4 44 --cvec-mode project --cvec-dir per-layer`.  None by default; --serve switches a loaded one per request.
     std::vector<std::pair<std::string, float>> cvec_files;
     int cvec_first = -1, cvec_last = -1;   ///< llama.cpp's defaults: 1 .. the last layer
-    int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default)
+    int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default), 2 = mlp
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
 };
 
@@ -956,7 +956,8 @@ void usage() {
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
-                 "  --cvec-mode add|project  h += s v (default) or h -= s (h.v) v with v unit\n"
+                 "  --cvec-mode add|project|mlp  h += s v (default), h -= s (h.v) v with v unit, or v added to the layer's\n"
+                 "                       MLP output before its hyper-connection write (single-neuron steering; Metal only)\n"
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
@@ -1944,11 +1945,12 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         digest = b.digest();
         if (digest == 0) digest = 1;   // 0 means "none loaded"
     }
-    summary = std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
+    static const char* const mode_names[] = {"project", "add", "mlp"};
+    summary = std::string(mode_names[o.cvec_mode]) + ":" + std::to_string(first) + "-" + std::to_string(last) +
               (single >= 0 ? ":single" + std::to_string(single) : "");
     // the line llama.cpp's patched build prints, so a log shows the same thing
     std::fprintf(stderr, "strata generate: control vector mode = %s, dir = %s, layers %d..%d (%d steered)\n",
-                 o.cvec_mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
+                 mode_names[o.cvec_mode], single >= 0 ? "single" : "per-layer", first, last, steered);
     return true;
 }
 
@@ -2728,7 +2730,8 @@ int main(int argc, char** argv) {
             const std::string m = next("--cvec-mode");
             if (m == "project") o.cvec_mode = 0;
             else if (m == "add") o.cvec_mode = 1;
-            else { std::fprintf(stderr, "--cvec-mode: add or project, got '%s'\n", m.c_str()); return 2; }
+            else if (m == "mlp") o.cvec_mode = 2;
+            else { std::fprintf(stderr, "--cvec-mode: add, project or mlp, got '%s'\n", m.c_str()); return 2; }
         }
         else if (a == "--cvec-dir") {
             const std::string d = next("--cvec-dir");
