@@ -2276,7 +2276,7 @@ bool Window::prompt_gemm_on(int64_t n) const {
         const char* e = std::getenv("STRATA_METAL_PROMPT_GEMM_MIN");
         return e ? (int64_t) std::atoll(e) : (int64_t) 64;
     }();
-    return on && n >= mn && pg_ != nullptr && !acts_live();
+    return on && n >= mn && pg_ != nullptr;
 }
 
 bool Window::prompt_gemm_init(std::string& err) {
@@ -2827,8 +2827,10 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
     if (g_window == nullptr) { err = "metal prompt: the decode window is not up yet"; return false; }
     static const bool windows = std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window";
     static const int64_t min_rows = std::getenv("STRATA_METAL_PROMPT_MIN") ? std::atoll(std::getenv("STRATA_METAL_PROMPT_MIN")) : 32;
-    if (!windows && !g_window->streaming() && n >= min_rows) return g_window->prompt(tokens, n, pos0, on_chunk, err);
-    if (!windows && g_window->streaming()) {
+    // STRATA_METAL_ACTS: the prompt kernels and the prompt GEMM capture nothing, so a capture reads prompts in windows
+    const bool whole = !windows && !acts_live();
+    if (whole && !g_window->streaming() && n >= min_rows) return g_window->prompt(tokens, n, pos0, on_chunk, err);
+    if (whole && g_window->streaming()) {
         const char* e = std::getenv("STRATA_METAL_PROMPT_GEMM");
         const char* em = std::getenv("STRATA_METAL_PROMPT_GEMM_MIN");
         const int64_t mn = em ? std::atoll(em) : 64;
