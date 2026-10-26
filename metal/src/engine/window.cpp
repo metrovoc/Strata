@@ -51,6 +51,7 @@ namespace strata::metal_engine {   // cvec_metal.cpp
 const std::vector<float>& cvec_dir();
 bool cvec_layer(int l);
 void cvec_bind_flag(int* on);
+const char* cvec_live();
 }  // namespace strata::metal_engine
 
 namespace strata::metal_engine {
@@ -192,12 +193,22 @@ private:
     void ple_cpu(int T);
     // --cvec-mode mlp (cvec_metal.cpp): layer l's vector added to its MLP output `bo` before the hyper-connection write
     mtl::Buffer cvbuf_, cvon_;
+    int64_t cvlive_stamp_ = -1;
+    void cvec_init();
     void cvec_bo(std::vector<mtl::Dispatch>& ds, int l, const mtl::Buffer& bo, int ntok);
     // STRATA_METAL_RNORM=FILE: |R| leaving every layer for every decoded token and stream, appended to FILE per window
     // as an int32 Tn and f32 [48][Tn][4] (the dose unit of a neuron push)
     mtl::Buffer rn_;
     void rnorm(std::vector<mtl::Dispatch>& ds, int l, int ntok);
     void rnorm_dump(int Tn);
+    // STRATA_METAL_ACTS=FILE: while FILE exists, every window's MoE activations (the down projections' inputs) are
+    // appended to it as an int32 Tn, an int64 pos0 and f32 [48][Tn][ACTW]: per token the 10 routed expert ids (int
+    // bits), their weights, the shared expert's gate logit, the 10 experts' 640 activations in rank order and the
+    // shared expert's 640.  Prompts then take the window path (no prompt GEMM), so every token is captured.
+    mtl::Buffer ac_, acon_;
+    void acts(std::vector<mtl::Dispatch>& ds, int l, int ntok);
+    void acts_arm();
+    void acts_dump(int Tn, int64_t pos0);
     // the MTP layer: the input branches + attention HC read + K/V append for `n` rows (srcR rows, host tokens) at
     // cells cell0..; with `full` (n == 1) the rest of the layer too and the draft head into mlm_/tokout_.  The
     // embedding rows go to memb_ rows erow..; tokens == nullptr: memb_ row erow already holds the embedding (put
@@ -1001,6 +1012,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         g.ind_off = P_IGU * 4;
         if (cuts_) cuts_->push_back((int) ds.size());   // the host's turn: this layer's experts put in place
         push(ds, g);
+        acts(ds, l, ntok);
         nb_ = true;
         gemv(ds, T(b + "ffn_down_shexp.weight"), XH_, ysh_, N, ntok);
         if (hd) had_rows(ds, lib_, "d:", h_, 0, h_, 0, ntok * TOPK, NFF, hsh_.handle ? &hsh_ : nullptr, false);   // H h, in place
@@ -1027,8 +1039,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
     cvec_bo(ds, l, bo_, ntok);
 }
 
-void Window::cvec_bo(std::vector<mtl::Dispatch>& ds, int l, const mtl::Buffer& bo, int ntok) {
-    if (!cvec_layer(l)) return;
+void Window::cvec_init() {
     if (!cvbuf_.ptr) {
         const std::vector<float>& dir = cvec_dir();
         cvbuf_ = cx_->alloc(dir.size() * 4);
@@ -1036,6 +1047,24 @@ void Window::cvec_bo(std::vector<mtl::Dispatch>& ds, int l, const mtl::Buffer& b
         cvon_ = cx_->alloc(16);
         cvec_bind_flag(cvon_.as<int>());
     }
+    const char* live = cvec_live();
+    if (live == nullptr) return;
+    std::error_code ec;
+    const auto t = std::filesystem::last_write_time(live, ec);
+    const int64_t stamp = ec ? -1 : (int64_t) t.time_since_epoch().count();
+    if (stamp == cvlive_stamp_) return;
+    cvlive_stamp_ = stamp;
+    std::memset(cvbuf_.ptr, 0, cvec_dir().size() * 4);
+    if (FILE* f = std::fopen(live, "rb")) {
+        const size_t got = std::fread(cvbuf_.ptr, 4, cvec_dir().size(), f);
+        std::fclose(f);
+        if (got != cvec_dir().size()) std::memset(cvbuf_.ptr, 0, cvec_dir().size() * 4);
+    }
+}
+
+void Window::cvec_bo(std::vector<mtl::Dispatch>& ds, int l, const mtl::Buffer& bo, int ntok) {
+    if (!cvec_layer(l)) return;
+    cvec_init();
     GlueArgs a{N, (uint32_t) ntok, N, 0};
     mtl::Dispatch d;
     d.p = P(lib_, "cvec_add_bo", {}, "cvec_add_bo");
@@ -1057,6 +1086,47 @@ void Window::rnorm(std::vector<mtl::Dispatch>& ds, int l, int ntok) {
     d.grid[1] = ntok;
     d.tg[0] = 256;
     push(ds, d);
+}
+
+namespace {
+constexpr int ACTW = 2 * TOPK + 1 + (TOPK + 1) * NFF;
+const char* acts_path() {
+    static const char* p = std::getenv("STRATA_METAL_ACTS");
+    return p;
+}
+bool acts_live() { return acts_path() != nullptr && std::filesystem::exists(acts_path()); }
+}  // namespace
+
+void Window::acts_arm() {
+    if (acts_path() == nullptr) return;
+    if (!acon_.ptr) {
+        ac_ = cx_->alloc((size_t) 48 * MAXT * ACTW * 4);
+        acon_ = cx_->alloc(16);
+    }
+    acon_.as<int>()[0] = acts_live() ? 1 : 0;
+}
+
+void Window::acts(std::vector<mtl::Dispatch>& ds, int l, int ntok) {
+    if (!acon_.ptr) return;
+    GlueArgs a{NFF, (uint32_t) ntok, N, TOPK};
+    mtl::Dispatch d;
+    d.p = P(lib_, "acts_cap", {}, "acts_cap");
+    d.args = {mtl::Arg::B(ids_), mtl::Arg::B(wts_), mtl::Arg::B(sg_), mtl::Arg::B(h_), mtl::Arg::B(plan_), mtl::Arg::B(XH_.b, 0),
+              mtl::Arg::B(acon_), mtl::Arg::B(ac_, (size_t) l * MAXT * ACTW * 4), mtl::Arg::V(a)};
+    d.grid[0] = (ntok * ACTW + 255) / 256;
+    d.tg[0] = 256;
+    push(ds, d);
+}
+
+void Window::acts_dump(int Tn, int64_t pos0) {
+    if (!acon_.ptr || acon_.as<int>()[0] == 0) return;
+    if (FILE* f = std::fopen(acts_path(), "ab")) {
+        const int32_t tn = Tn;
+        std::fwrite(&tn, 4, 1, f);
+        std::fwrite(&pos0, 8, 1, f);
+        for (int l = 0; l < 48; ++l) std::fwrite(ac_.as<float>() + (size_t) l * MAXT * ACTW, 4, (size_t) Tn * ACTW, f);
+        std::fclose(f);
+    }
 }
 
 void Window::rnorm_dump(int Tn) {
@@ -1137,6 +1207,8 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     if (Tn < 1 || Tn > MAXT || (head && Tn > max_t_)) { err = "metal window: window size out of range"; return false; }
     if (pos0 + Tn + 1 >= max_cells_) { err = "metal window: the window runs past the context"; return false; }
     const double t0 = now_ms();
+    acts_arm();
+    if (cvec_live() && cvec_layer(1)) cvec_init();
     // ---- the embeddings (CPU dequant of the token rows straight into the shared buffer), broadcast to the streams
     const gguf::Tensor& te = T("token_embd.weight");
     const size_t rb = ref::row_bytes(te.type, N);
@@ -1197,6 +1269,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         tp_rg_ = now_ms() - r0;
         last_n_disp_ = (int) c.ds.size();
         rnorm_dump(Tn);
+        acts_dump(Tn, pos0);
         return finish(Tn, tokens, pos0, head, out, t0);
     }
     if (stream_ && !st_->ready() && !stream_arena(err)) return false;
@@ -1278,6 +1351,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     tp_rg_ = now_ms() - r0;
     last_n_disp_ = (int) ds.size();
     rnorm_dump(Tn);
+    acts_dump(Tn, pos0);
     return finish(Tn, tokens, pos0, head, out, t0);
 }
 
@@ -2202,7 +2276,7 @@ bool Window::prompt_gemm_on(int64_t n) const {
         const char* e = std::getenv("STRATA_METAL_PROMPT_GEMM_MIN");
         return e ? (int64_t) std::atoll(e) : (int64_t) 64;
     }();
-    return on && n >= mn && pg_ != nullptr;
+    return on && n >= mn && pg_ != nullptr && !acts_live();
 }
 
 bool Window::prompt_gemm_init(std::string& err) {

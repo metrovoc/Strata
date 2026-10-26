@@ -89,3 +89,23 @@ kernel void rnorm_cap(device const float* R [[buffer(0)]], device float* out [[b
         out[t * a.n + c] = sqrt(tot);
     }
 }
+
+// acts_cap (STRATA_METAL_ACTS, window.cpp): one layer's MoE activations for every token, into out[t * W + i] with W =
+// 2 topk + 1 + (topk + 1) n: the routed ids (int bits), their weights, the shared gate logit, each routed expert's n
+// activations in rank order, then the shared expert's (swiglu_prep's plane 0).  a.n = n_ff.  on = 0: nothing.
+kernel void acts_cap(device const int* ids [[buffer(0)]], device const float* w [[buffer(1)]], device const float* sg [[buffer(2)]],
+                     device const float* h [[buffer(3)]], device const int* plan [[buffer(4)]], device const float* hs [[buffer(5)]],
+                     device const int* on [[buffer(6)]], device float* out [[buffer(7)]], constant GlueArgs& a [[buffer(8)]],
+                     uint gid [[thread_position_in_grid]]) {
+    const uint W = 2 * a.topk + 1 + (a.topk + 1) * a.n, t = gid / W, i = gid % W;
+    if (t >= a.n_tok || on[0] == 0) return;
+    float v;
+    if (i < a.topk) v = as_type<float>(ids[t * a.topk + i]);
+    else if (i < 2 * a.topk) v = w[t * a.topk + i - a.topk];
+    else if (i == 2 * a.topk) v = sg[t];
+    else {
+        const uint j = i - 2 * a.topk - 1, k = j / a.n, d = j % a.n;
+        v = k < a.topk ? h[plan[P_TOKENT + t * a.topk + k] * int(a.n) + d] : hs[t * a.n + d];
+    }
+    out[gid] = v;
+}

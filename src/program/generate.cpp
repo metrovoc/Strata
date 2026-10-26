@@ -12588,7 +12588,19 @@ int main(int argc, char** argv) {
             // #879: an earlier window met non-finite logits.  The poison sits in a conversation's K/V and recurrent
             // state, so nothing that may hold it is continued: the live session, every checkpoint, every parked
             // conversation and every idle batch slot go, and this prompt is read from token 0 (resume == 0 below)
-            if (nan_flush) {
+            // STRATA_METAL_CVEC_LIVE (metal/src/engine/cvec_metal.cpp): a new vector in the file makes every cached
+            // conversation stale the same way, so it is flushed alike
+            static int64_t cvec_live_stamp = 0;
+            bool cvec_live_new = false;
+            if (const char* lp = std::getenv("STRATA_METAL_CVEC_LIVE")) {
+                std::error_code ec;
+                const auto t = std::filesystem::last_write_time(lp, ec);
+                const int64_t stamp = ec ? -1 : (int64_t) t.time_since_epoch().count();
+                cvec_live_new = stamp != cvec_live_stamp;
+                cvec_live_stamp = stamp;
+            }
+            if (nan_flush || cvec_live_new) {
+                const bool non_finite = nan_flush;
                 nan_flush = false;
                 if (nf_prompt_windows) {
                     nf_prompt_windows = false;
@@ -12617,7 +12629,10 @@ int main(int argc, char** argv) {
                         sl.checks.clear();
                         ++n_slots;
                     }
-                std::fprintf(stderr, "strata serve: after non-finite logits (#879): dropped the live session, %zu "
+                std::fprintf(stderr, non_finite ? "strata serve: after non-finite logits (#879): dropped the live session, %zu "
+                                     "checkpoint%s, %zu parked conversation%s and %zu idle slot%s (%zu running slot%s "
+                                     "not kept after their reply); reading this prompt from token 0\n"
+                                     : "strata serve: a new live control vector: dropped the live session, %zu "
                                      "checkpoint%s, %zu parked conversation%s and %zu idle slot%s (%zu running slot%s "
                                      "not kept after their reply); reading this prompt from token 0\n", n_checks,
                              n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,

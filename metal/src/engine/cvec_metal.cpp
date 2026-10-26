@@ -1,10 +1,12 @@
 // metal/src/engine/cvec_metal.cpp - the control vector on Metal: --cvec-mode mlp only.  The loader's tables stay on the host
 // (unified memory); the Window copies them into its own buffer the first time it encodes a layer, and adds layer l's d to
-// the MLP output bo before the hyper-connection write (glue.metal's cvec_add_bo).  `covers()` stays false so the shared
+// the MLP output bo before the hyper-connection write (glue.metal's cvec_add_bo).  STRATA_METAL_CVEC_LIVE=FILE: every layer
+// from 1 is steered from FILE instead (f32 [layers][n_embd], re-read when it changes), so a new vector needs no restart.  `covers()` stays false so the shared
 // host paths written for the CUDA kernels (prefill, verify) never steer.
 #include "strata/kernels/cvec.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 
 namespace strata::metal_engine {
 namespace {
@@ -16,7 +18,13 @@ int* g_on_dev = nullptr;     // the Window's flag buffer, read by cvec_add_bo
 }  // namespace
 
 const std::vector<float>& cvec_dir() { return g_dir; }
-bool cvec_layer(int l) { return g_cvec.loaded() && l >= g_cvec.first && l <= g_cvec.last && l < (int) g_layer.size() && g_layer[(size_t) l]; }
+const char* cvec_live() {
+    static const char* p = std::getenv("STRATA_METAL_CVEC_LIVE");
+    return p;
+}
+bool cvec_layer(int l) {
+    if (cvec_live() && g_cvec.loaded()) return l >= 1 && l < (int) g_layer.size();
+    return g_cvec.loaded() && l >= g_cvec.first && l <= g_cvec.last && l < (int) g_layer.size() && g_layer[(size_t) l]; }
 void cvec_bind_flag(int* on) {
     g_on_dev = on;
     *g_on_dev = g_on ? 1 : 0;
